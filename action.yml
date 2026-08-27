@@ -1,0 +1,172 @@
+# The Syntropy Agent action — the generic interface.
+#
+# THE MENTAL MODEL: your org's agent is the MEMORY — learned skills and
+# accumulated judgment, resolved from this repository's Syntropy App
+# installation. Everything in `with:` is a FRAME that memory is placed
+# into: the prompt, the branch, the delivery target. A merge-conflict
+# frame and a fix-red-CI frame teach the SAME agent; a new use case is a
+# new wrapper workflow around this one step, never a new agent.
+#
+# THE CONTRACT: this step sends your frame to the Syntropy control plane,
+# authenticated by this workflow run's own OIDC token — GitHub itself
+# attests which repository and workflow is calling; no secret is ever
+# stored here or in your repo. The agent acts on the named branch through
+# the Syntropy App installation (its pushes and comments carry the App's
+# identity, so CI triggers normally), and its reply lands on the thread
+# you name in `comment-on` — this step simply watches that thread for the
+# App's reply when `wait` is on.
+#
+# Nothing proprietary ships in this repository: it is the interface, not
+# the implementation.
+
+name: "Syntropy Agent"
+description: >-
+  Run one Syntropy agent turn on a branch of this repository. The agent is
+  your org's remembering worker; this step's inputs are the frame it works
+  in.
+branding:
+  icon: git-merge
+  color: purple
+
+inputs:
+  prompt:
+    description: >-
+      The frame's job — what this turn should do on the branch. The one
+      required input.
+    required: true
+  branch:
+    description: >-
+      The branch the agent works on. Defaults to this workflow run's own
+      branch. The repository's default branch is refused — point the frame
+      at a working branch.
+    required: false
+    default: ""
+  comment-on:
+    description: >-
+      Issue or PR number this frame belongs to — the thread the agent's
+      reply lands on, and (for a PR) the branch authority the session
+      binds to. Required by v1 frames.
+    required: false
+    default: ""
+  agent:
+    description: >-
+      Which of your org's agents answers — WHICH MEMORY CONTINUES. Omit it
+      and the org's single agent answers; name one only when your org
+      deliberately keeps more than one.
+    required: false
+    default: ""
+  wait:
+    description: >-
+      Watch the thread for the agent's reply and mirror the outcome
+      ("true"/"false"). "false" fires the frame and returns immediately.
+    required: false
+    default: "true"
+  wait-minutes:
+    description: Ceiling on the wait, in minutes.
+    required: false
+    default: "30"
+  server:
+    description: The Syntropy control plane origin.
+    required: false
+    default: "https://mod.syntropy.systems"
+
+outputs:
+  thread:
+    description: The thread the frame landed on (repo#number form).
+    value: ${{ steps.invoke.outputs.thread }}
+  reply-url:
+    description: The agent's reply comment, when `wait` is true and it landed.
+    value: ${{ steps.invoke.outputs.reply-url }}
+
+runs:
+  using: composite
+  steps:
+    - id: invoke
+      uses: actions/github-script@v7
+      env:
+        SYNTROPY_PROMPT: ${{ inputs.prompt }}
+        SYNTROPY_BRANCH: ${{ inputs.branch }}
+        SYNTROPY_COMMENT_ON: ${{ inputs.comment-on }}
+        SYNTROPY_AGENT: ${{ inputs.agent }}
+        SYNTROPY_WAIT: ${{ inputs.wait }}
+        SYNTROPY_WAIT_MINUTES: ${{ inputs.wait-minutes }}
+        SYNTROPY_SERVER: ${{ inputs.server }}
+      with:
+        script: |
+          const server = new URL(process.env.SYNTROPY_SERVER).origin;
+          const branch = process.env.SYNTROPY_BRANCH ||
+            (context.ref.startsWith("refs/heads/") ? context.ref.slice("refs/heads/".length) : context.ref);
+
+          // GitHub's own attestation of this repository + workflow, minted
+          // for the control plane's origin. Requires `id-token: write` in
+          // the calling workflow's permissions block.
+          const proof = await core.getIDToken(server);
+
+          const response = await fetch(`${server}/member/github/invoke`, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${proof}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              repository: `${context.repo.owner}/${context.repo.repo}`,
+              branch,
+              prompt: process.env.SYNTROPY_PROMPT,
+              comment_on: process.env.SYNTROPY_COMMENT_ON ? Number(process.env.SYNTROPY_COMMENT_ON) : null,
+              agent: process.env.SYNTROPY_AGENT || null,
+            }),
+          });
+          const text = await response.text();
+          if (response.status === 404) {
+            core.setFailed(
+              `${server} does not serve the invoke door yet — this action needs a ` +
+                `control plane at or beyond the ADR 027 stage-2 surface. The server answered: ${text}`,
+            );
+            return;
+          }
+          if (!response.ok) {
+            // The platform's refusals are complete sentences; relay them.
+            core.setFailed(`${server}/member/github/invoke answered HTTP ${response.status}: ${text}`);
+            return;
+          }
+          const accepted = JSON.parse(text);
+          const invokedAt = new Date().toISOString();
+          const issue = Number(process.env.SYNTROPY_COMMENT_ON || 0);
+          core.info(`frame accepted (${accepted.agent_id ?? "agent"} on ${accepted.thread ?? "thread"})`);
+          core.setOutput("thread", accepted.thread ?? "");
+
+          if (process.env.SYNTROPY_WAIT !== "true") return;
+          if (!issue) {
+            core.info("no comment-on thread to watch — fire-and-forget");
+            return;
+          }
+
+          // VENDOR-NATIVE WAIT (v1 contract): the turn's reply lands on the
+          // thread as a comment carrying the Syntropy App's identity; this
+          // step simply watches the thread for the first App comment newer
+          // than the invocation. No Syntropy-side status state exists to
+          // poll — GitHub is the status surface.
+          const deadline = Date.now() + Number(process.env.SYNTROPY_WAIT_MINUTES) * 60_000;
+          for (;;) {
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue,
+              since: invokedAt,
+              per_page: 100,
+            });
+            const reply = comments.find((c) => c.user?.type === "Bot");
+            if (reply) {
+              core.setOutput("reply-url", reply.html_url);
+              core.info(`the agent replied: ${reply.html_url}`);
+              return;
+            }
+            if (Date.now() > deadline) {
+              core.setFailed(
+                `no reply landed on #${issue} within ${process.env.SYNTROPY_WAIT_MINUTES} minutes — ` +
+                  `the turn may still be running; watch the thread`,
+              );
+              return;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 20_000));
+          }
